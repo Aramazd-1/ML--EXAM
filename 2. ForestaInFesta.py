@@ -1,272 +1,911 @@
+import os
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit
+import matplotlib.pyplot as plt
+from sklearn.model_selection import LeaveOneGroupOut, ShuffleSplit
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import time as tm
 
-# =========================
-# 1) LOAD DATA
-# =========================
-DATA_PATH = "nfip_claims_FL_2020.csv"   # <- swap to multi-state file when ready
-df = pd.read_csv(DATA_PATH, low_memory=False)
+# ============================================================
+# 0) CONFIG
+# ============================================================
+DATA_PATH = "nfip_claims_ALL_STATES_2020.csv"  # <-- set this
+OUT_DIR = "rf_outputs_nfip_clean"
+os.makedirs(OUT_DIR, exist_ok=True)
+RANDOM_STATE = 42
+replicate_whole = False  # Disables replication of the diagnostic and tuning plots
+# Extended labels (covers ALL FIELDS; you can shorten/rename anytime)
+LABELS = {
+    "agricultureStructureIndicator": "Agriculture structure (indicator)",
+    "amountPaidOnBuildingClaim": "Paid on building claim (LEAKAGE)",
+    "amountPaidOnContentsClaim": "Paid on contents claim (LEAKAGE)",
+    "amountPaidOnIncreasedCostOfComplianceClaim": "Paid on ICC claim (LEAKAGE)",
+    "asOfDate": "As-of date",
+    "baseFloodElevation": "Base flood elevation (BFE)",
+    "basementEnclosureCrawlspaceType": "Basement/enclosure/crawlspace type",
+    "buildingDamageAmount": "Building damage amount",
+    "buildingDeductibleCode": "Building deductible code",
+    "buildingDescriptionCode": "Building description code",
+    "buildingPropertyValue": "Building property value",
+    "buildingReplacementCost": "Building replacement cost",
+    "causeOfDamage": "Cause of damage",
+    "censusBlockGroupFips": "Census block group (FIPS)",
+    "censusTract": "Census tract",
+    "condominiumCoverageTypeCode": "Condo coverage type code",
+    "contentsDamageAmount": "Contents damage amount",
+    "contentsDeductibleCode": "Contents deductible code",
+    "contentsPropertyValue": "Contents property value",
+    "contentsReplacementCost": "Contents replacement cost",
+    "countyCode": "County code",
+    "crsClassificationCode": "CRS classification",
+    "dateOfLoss": "Date of loss",
+    "disasterAssistanceCoverageRequired": "Disaster assistance coverage required",
+    "elevatedBuildingIndicator": "Elevated building (indicator)",
+    "elevationCertificateIndicator": "Elevation certificate (indicator)",
+    "elevationDifference": "Elevation difference",
+    "eventDesignationNumber": "Event designation number",
+    "ficoNumber": "FICO number",
+    "floodCharacteristicsIndicator": "Flood characteristics (indicator)",
+    "floodEvent": "Flood event",
+    "floodWaterDuration": "Floodwater duration",
+    "floodZoneCurrent": "Flood zone (current)",
+    "floodproofedIndicator": "Floodproofed (indicator)",
+    "houseWorship": "House of worship (indicator)",
+    "iccCoverage": "ICC coverage",
+    "id": "Record ID",
+    "latitude": "Latitude",
+    "locationOfContents": "Location of contents",
+    "longitude": "Longitude",
+    "lowestAdjacentGrade": "Lowest adjacent grade",
+    "lowestFloorElevation": "Lowest floor elevation",
+    "netBuildingPaymentAmount": "Net building payment (LEAKAGE)",
+    "netContentsPaymentAmount": "Net contents payment (LEAKAGE)",
+    "netIccPaymentAmount": "Net ICC payment (LEAKAGE)",
+    "nfipCommunityName": "NFIP community name",
+    "nfipCommunityNumberCurrent": "NFIP community number (current)",
+    "nfipRatedCommunityNumber": "NFIP rated community number",
+    "nonPaymentReasonBuilding": "Non-payment reason (building)",
+    "nonPaymentReasonContents": "Non-payment reason (contents)",
+    "nonProfitIndicator": "Non-profit (indicator)",
+    "numberOfFloorsInTheInsuredBuilding": "Number of floors",
+    "numberOfUnits": "Number of units",
+    "obstructionType": "Obstruction type",
+    "occupancyType": "Occupancy type",
+    "originalConstructionDate": "Original construction date",
+    "originalNBDate": "Original policy inception date (NB)",
+    "policyCount": "Policy count",
+    "postFIRMConstructionIndicator": "Post-FIRM construction (indicator)",
+    "primaryResidenceIndicator": "Primary residence (indicator)",
+    "rateMethod": "Rate method",
+    "ratedFloodZone": "Flood zone (rated)",
+    "rentalPropertyIndicator": "Rental property (indicator)",
+    "replacementCostBasis": "Replacement cost basis",
+    "reportedCity": "Reported city",
+    "reportedZipCode": "Reported ZIP",
+    "smallBusinessIndicatorBuilding": "Small business (building) indicator",
+    "state": "State",
+    "stateOwnedIndicator": "State-owned (indicator)",
+    "totalBuildingInsuranceCoverage": "Total building coverage",
+    "totalContentsInsuranceCoverage": "Total contents coverage",
+    "waterDepth": "Water depth",
+    "yearOfLoss": "Year of loss",
+}
 
-# =========================
-# 2) NUMERIC CASTS (only for columns we may use)
-# =========================
-num_like = [
-    # Damage + replacement costs (for target construction)
+FIELDS = [
+    'agricultureStructureIndicator', 'amountPaidOnBuildingClaim',
+    'amountPaidOnContentsClaim', 'amountPaidOnIncreasedCostOfComplianceClaim',
+    'asOfDate', 'baseFloodElevation', 'basementEnclosureCrawlspaceType',
+    'buildingDamageAmount', 'buildingDeductibleCode', 'buildingDescriptionCode',
+    'buildingPropertyValue', 'buildingReplacementCost', 'causeOfDamage',
+    'censusBlockGroupFips', 'censusTract', 'condominiumCoverageTypeCode',
+    'contentsDamageAmount', 'contentsDeductibleCode', 'contentsPropertyValue',
+    'contentsReplacementCost', 'countyCode', 'crsClassificationCode',
+    'dateOfLoss', 'disasterAssistanceCoverageRequired', 'elevatedBuildingIndicator',
+    'elevationCertificateIndicator', 'elevationDifference', 'eventDesignationNumber',
+    'ficoNumber', 'floodCharacteristicsIndicator', 'floodEvent', 'floodWaterDuration',
+    'floodZoneCurrent', 'floodproofedIndicator', 'houseWorship', 'iccCoverage',
+    'id', 'latitude', 'locationOfContents', 'longitude', 'lowestAdjacentGrade',
+    'lowestFloorElevation', 'netBuildingPaymentAmount', 'netContentsPaymentAmount',
+    'netIccPaymentAmount', 'nfipCommunityName', 'nfipCommunityNumberCurrent',
+    'nfipRatedCommunityNumber', 'nonPaymentReasonBuilding', 'nonPaymentReasonContents',
+    'nonProfitIndicator', 'numberOfFloorsInTheInsuredBuilding', 'numberOfUnits',
+    'obstructionType', 'occupancyType', 'originalConstructionDate', 'originalNBDate',
+    'policyCount', 'postFIRMConstructionIndicator', 'primaryResidenceIndicator',
+    'rateMethod', 'ratedFloodZone', 'rentalPropertyIndicator', 'replacementCostBasis',
+    'reportedCity', 'reportedZipCode', 'smallBusinessIndicatorBuilding', 'state',
+    'stateOwnedIndicator', 'totalBuildingInsuranceCoverage',
+    'totalContentsInsuranceCoverage', 'waterDepth', 'yearOfLoss'
+]
+
+DROP = {"asOfDate", "dateOfLoss", "yearOfLoss"}
+FIELDS_MINUS = [f for f in FIELDS if f not in DROP]
+
+NUM_LIKE = [
     "buildingDamageAmount", "contentsDamageAmount",
     "buildingReplacementCost", "contentsReplacementCost",
-
-    # Exposure/value proxies (features)
     "buildingPropertyValue", "contentsPropertyValue",
     "totalBuildingInsuranceCoverage", "totalContentsInsuranceCoverage",
-
-    # Hazard / intensity proxies (features)
     "waterDepth", "floodWaterDuration",
     "baseFloodElevation", "elevationDifference", "lowestAdjacentGrade", "lowestFloorElevation",
-
-    # Location / structure (features)
     "latitude", "longitude",
     "numberOfFloorsInTheInsuredBuilding", "numberOfUnits", "policyCount",
-
-    # Time (feature or splitting)
-    "yearOfLoss"
 ]
-for c in num_like:
-    if c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# =========================
-# 3) TARGET: DAMAGE RATIO (building + contents)
-# =========================
-needed = {
-    "buildingDamageAmount", "contentsDamageAmount",
-    "buildingReplacementCost", "contentsReplacementCost"
-}
-missing = [c for c in needed if c not in df.columns]
-if missing:
-    raise ValueError(f"Missing required columns for damage ratio: {missing}")
-
-damage_total = df["buildingDamageAmount"].fillna(0) + df["contentsDamageAmount"].fillna(0)
-repl_total = df["buildingReplacementCost"].fillna(0) + df["contentsReplacementCost"].fillna(0)
-
-# Keep only rows where denominator is positive and target is observed in a meaningful way
-valid = repl_total > 0
-df = df.loc[valid].copy()
-damage_total = damage_total.loc[valid]
-repl_total = repl_total.loc[valid]
-
-y = (damage_total / repl_total).clip(lower=0, upper=1)  # ratio in [0,1]
-
-# =========================
-# 4) FEATURES: DROP LEAKAGE / POST-OUTCOME PAYMENT VARS
-# =========================
-# Anything that is an outcome/payment realization should not be in X.
-leakage_cols = [
-    # payments / payouts (post-claim)
+LEAKAGE_COLS = [
     "amountPaidOnBuildingClaim",
     "amountPaidOnContentsClaim",
     "amountPaidOnIncreasedCostOfComplianceClaim",
     "netBuildingPaymentAmount",
     "netContentsPaymentAmount",
     "netIccPaymentAmount",
-    "paid_total_net",
+    "nonPaymentReasonBuilding",
+    "nonPaymentReasonContents",
 ]
 
-# Also drop the components used to *construct the target* only if you consider them "label-side"
-# Damage components MUST be dropped (they are literally the numerator of y).
-target_components_to_drop = [
-    "buildingDamageAmount",
-    "contentsDamageAmount",
-]
+ID_COLS = ["id"]
 
-# Identifiers you don't want as predictors
-id_cols = ["id"]
+# RF defaults
+N_ESTIMATORS = 200  # Trees used in the estimation
+MIN_SAMPLES_LEAF = 20   # Minimum samples per leaf
+MAX_FEATURES_DEFAULT = 0.3  # fraction of features to consider at each split
 
-drop_cols = [c for c in (leakage_cols + target_components_to_drop + id_cols) if c in df.columns]
 
-X = df.drop(columns=drop_cols)
+# ============================================================
+# 1) METRICS
+# ============================================================
+def rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
-# Drop columns that are entirely missing
-all_missing = [c for c in X.columns if X[c].isna().all()]
-if all_missing:
-    X = X.drop(columns=all_missing)
 
-# =========================
-# 5) SPLIT DESIGN + REPEATED EVALUATION
-# =========================
-from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+def pearson_corr(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
 
-event_candidates = ["eventDesignationNumber", "femaDisasterNumber", "disasterNumber", "eventId"]
-state_candidates = ["state", "stateCode", "reportedState", "propertyState"]
-year_col = "yearOfLoss" if "yearOfLoss" in df.columns else None
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[m]
+    y_pred = y_pred[m]
 
-# ---- choose grouping column (event > state) ----
-group_col = None
-group_kind = None
-groups = None
+    if len(y_true) < 2:
+        return np.nan
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return np.nan
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
 
-for c in event_candidates:
-    if c in df.columns:
-        g = df.loc[X.index, c].astype("string").fillna("MISSING")
-        if g.nunique() >= 5:
-            group_col = c
-            group_kind = "event"
-            groups = g
-            break
 
-if group_col is None:
-    for c in state_candidates:
-        if c in df.columns:
-            g = df.loc[X.index, c].astype("string").fillna("MISSING")
-            if g.nunique() >= 5:
-                group_col = c
-                group_kind = "state"
-                groups = g
-                break
-
-use_time_split = (group_col is None)
-
-# IMPORTANT: remove grouping col from X if present (avoid memorization)
-if group_col is not None and group_col in X.columns:
-    X = X.drop(columns=[group_col])
-
-# =========================
-# 6) PREPROCESS + MODEL (define ONCE, fit many times)
-# =========================
-# Numeric columns = those in num_like that survived AND are in X
-num_cols = [c for c in num_like if c in X.columns]
-cat_cols = [c for c in X.columns if c not in num_cols]
-
-numeric_pipe = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
-])
-
-categorical_pipe = Pipeline([
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("to_str", FunctionTransformer(lambda a: a.astype(str), feature_names_out="one-to-one")),
-    ("onehot", OneHotEncoder(handle_unknown="ignore")),
-])
-
-preprocess = ColumnTransformer([
-    ("num", numeric_pipe, num_cols),
-    ("cat", categorical_pipe, cat_cols),
-])
-
-rf = RandomForestRegressor(
-    n_estimators=500,
-    min_samples_leaf=5,
-    n_jobs=-1,
-    random_state=42
-)
-
-model = Pipeline([("prep", preprocess), ("rf", rf)])
-
-# =========================
-# 7) EVALUATION
-# =========================
-def metrics_ratio(y_true, y_pred):
-    y_pred = np.clip(y_pred, 0, 1)
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    mae = float(mean_absolute_error(y_true, y_pred))
-    r2 = float(r2_score(y_true, y_pred))
-    return rmse, mae, r2
-
-def group_weighted_rmse(y_true, y_pred, g):
-    # each group has weight 1 (average of per-group RMSE)
+def metrics_paper(y_true, y_pred):
     y_true = np.asarray(y_true)
-    y_pred = np.clip(np.asarray(y_pred), 0, 1)
-    g = pd.Series(g).astype("string")
-    per = []
-    for key in g.unique():
-        m = (g == key).to_numpy()
-        per.append(np.sqrt(np.mean((y_true[m] - y_pred[m]) ** 2)))
-    return float(np.mean(per))
+    y_pred = np.asarray(y_pred)
 
-if not use_time_split:
-    # --- repeated grouped holdouts ---
-    R = 50
-    test_size = 0.20
-    base_seed = 42
+    mae = float(mean_absolute_error(y_true, y_pred))
+    mbe = float(np.mean(y_pred - y_true))  # positive = overprediction
+    r2 = float(r2_score(y_true, y_pred))
+    corr = pearson_corr(y_true, y_pred)
+    _rmse = rmse(y_true, y_pred)
 
-    rmse_claim, mae_claim, r2_claim = [], [], []
-    rmse_group = []
+    mean_y = float(np.mean(y_true))
+    mae_norm = float(mae / mean_y) if mean_y != 0 else np.nan
+    mbe_norm = float(mbe / mean_y) if mean_y != 0 else np.nan
 
-    for r in range(R):
-        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=base_seed + r)
-        tr, te = next(gss.split(X, y, groups=groups))
+    return {
+        "rmse": _rmse,
+        "mae": mae,
+        "mbe": mbe,
+        "r2": r2,
+        "corr": corr,
+        "mae_norm": mae_norm,
+        "mbe_norm": mbe_norm,
+    }
 
+
+# ============================================================
+# 2) PREPROCESS + MODEL
+# ============================================================
+def make_preprocess(X: pd.DataFrame) -> ColumnTransformer:
+    num_cols = [c for c in X.columns if (c in NUM_LIKE) or pd.api.types.is_numeric_dtype(X[c])]
+    cat_cols = [c for c in X.columns if c not in num_cols]
+
+    numeric_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+    ])
+
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("to_str", FunctionTransformer(lambda a: a.astype(str), feature_names_out="one-to-one")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    return ColumnTransformer([
+        ("num", numeric_pipe, num_cols),
+        ("cat", categorical_pipe, cat_cols),
+    ])
+
+
+def make_model(prep: ColumnTransformer, max_features=MAX_FEATURES_DEFAULT) -> Pipeline:
+    rf = RandomForestRegressor(
+        n_estimators=N_ESTIMATORS,
+        min_samples_leaf=MIN_SAMPLES_LEAF,
+        max_features=max_features,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        bootstrap=True,
+        oob_score=True,
+    )
+    return Pipeline([("prep", prep), ("rf", rf)])
+
+
+def postprocess_fn(target_kind: str):
+    if target_kind == "ratio":
+        return lambda p: np.clip(p, 0, None)  # keep >=0, do NOT cap at 1 unless you want
+    else:
+        return lambda p: np.maximum(p, 0)
+
+
+# ============================================================
+# 3) DATASET BUILDER
+# ============================================================
+def build_dataset(df: pd.DataFrame, target_kind: str):
+    use_cols = [c for c in FIELDS_MINUS if c in df.columns]
+    df_use = df[use_cols].copy()
+
+    # coerce numeric-like
+    for c in NUM_LIKE:
+        if c in df_use.columns:
+            df_use[c] = pd.to_numeric(df_use[c], errors="coerce")
+
+    dmg_b = df_use.get("buildingDamageAmount", 0).fillna(0)
+    dmg_c = df_use.get("contentsDamageAmount", 0).fillna(0)
+    damage_total = dmg_b + dmg_c
+
+    repl_b = df_use.get("buildingReplacementCost", 0).fillna(0)
+    repl_c = df_use.get("contentsReplacementCost", 0).fillna(0)
+    repl_total = repl_b + repl_c
+
+    if target_kind == "ratio":
+        MIN_REPL = 1000
+        mask = (repl_total >= MIN_REPL)
+
+        mask &= ~((dmg_c > 0) & (repl_c <= 0))
+        mask &= ~((dmg_b > 0) & (repl_b <= 0))
+
+        y_raw = (damage_total[mask] / repl_total[mask]).astype(float)  # pandas Series
+        CAP_Q = 99.5
+        cap = np.nanpercentile(y_raw.to_numpy(), CAP_Q)
+        y = pd.Series(np.clip(y_raw.to_numpy(), 0, cap), index=y_raw.index)
+
+        target_drop = [
+            "buildingDamageAmount", "contentsDamageAmount",
+            "buildingReplacementCost", "contentsReplacementCost"
+        ]
+
+    elif target_kind == "log_damage":
+        mask = np.ones(len(df_use), dtype=bool)
+        y = np.log1p(damage_total).astype(float)
+        target_drop = ["buildingDamageAmount", "contentsDamageAmount"]
+
+    else:
+        raise ValueError("target_kind must be 'ratio' or 'log_damage'")
+
+    groups_event = None
+    if "eventDesignationNumber" in df_use.columns:
+        groups_event = df_use.loc[mask, "eventDesignationNumber"].astype("string").fillna("MISSING")
+
+    groups_state = None
+    if "state" in df_use.columns:
+        groups_state = df_use.loc[mask, "state"].astype("string").fillna("MISSING")
+
+    drop_cols = [c for c in (LEAKAGE_COLS + ID_COLS + target_drop) if c in df_use.columns]
+    X = df_use.loc[mask].drop(columns=drop_cols).copy()
+
+    # remove group cols from X
+    for gc in ["eventDesignationNumber", "state"]:
+        if gc in X.columns:
+            X = X.drop(columns=[gc])
+
+    # drop all-missing cols
+    all_missing = [c for c in X.columns if X[c].isna().all()]
+    if all_missing:
+        X = X.drop(columns=all_missing)
+
+    # Align y index to X (important for ratio case)
+    if isinstance(y, pd.Series):
+        y = y.loc[X.index]
+    else:
+        y = pd.Series(y, index=X.index)
+
+    return X, y, groups_event, groups_state
+
+
+# ============================================================
+# 4) OOB METRICS FROM FITTED MODEL
+# ============================================================
+def oob_metrics_from_model(model: Pipeline, y_train, postprocess):
+    rf = model.named_steps["rf"]
+    oob = rf.oob_prediction_
+    mask = ~np.isnan(oob)
+    y_true = np.asarray(y_train)[mask]
+    y_pred = np.asarray(oob)[mask]
+    y_pred = postprocess(y_pred)
+    return metrics_paper(y_true, y_pred)
+
+
+# ============================================================
+# 5) PERMUTATION IMPORTANCE as %IncMSE (neg -> 0)
+# ============================================================
+def perm_importance_percent_inc_mse(model: Pipeline, X_test: pd.DataFrame, y_test,
+                                    postprocess=lambda p: p, n_repeats=5):
+    y_test = np.asarray(y_test)
+    base_pred = postprocess(model.predict(X_test))
+    base_mse = mean_squared_error(y_test, base_pred)
+
+    rng = np.random.default_rng(RANDOM_STATE)
+    out = []
+    for col in X_test.columns:
+        mses = []
+        for _ in range(n_repeats):
+            Xp = X_test.copy()
+            Xp[col] = rng.permutation(Xp[col].values)
+            pred_p = postprocess(model.predict(Xp))
+            mses.append(mean_squared_error(y_test, pred_p))
+        mse_p = float(np.mean(mses))
+        inc = 100.0 * (mse_p - base_mse) / base_mse
+        out.append((col, inc))
+
+    imp_df = pd.DataFrame(out, columns=["feature", "pct_inc_mse"])
+    imp_df["pct_inc_mse"] = imp_df["pct_inc_mse"].clip(lower=0)
+    return imp_df.sort_values("pct_inc_mse", ascending=False)
+
+
+def plot_varimp_percent_inc_mse(model, X_test, y_test, postprocess, out_png, top_n=20, n_repeats=5):
+    imp_df = perm_importance_percent_inc_mse(
+        model, X_test, y_test, postprocess=postprocess, n_repeats=n_repeats
+    ).head(top_n)
+
+    imp_df["label"] = imp_df["feature"].map(LABELS).fillna(imp_df["feature"])
+
+    plt.figure()
+    plt.barh(imp_df["label"][::-1], imp_df["pct_inc_mse"][::-1])
+    plt.xlabel("%IncMSE (neg -> 0)")
+    plt.title("Permutation importance (holdout)")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+def collapse_mdi_by_variable(model, top_n=30):
+    prep = model.named_steps["prep"]
+    rf = model.named_steps["rf"]
+    feat_names = prep.get_feature_names_out()
+    imp = rf.feature_importances_
+
+    df_imp = pd.DataFrame({"feat": feat_names, "imp": imp})
+
+    # formats like "num__waterDepth" or "cat__occupancyType_3"
+    def base_var(s):
+        s = s.split("__", 1)[-1]
+        return s.split("_", 1)[0]  # before first "_" in one-hot
+
+    df_imp["var"] = df_imp["feat"].apply(base_var)
+    out = df_imp.groupby("var", as_index=False)["imp"].sum().sort_values("imp", ascending=False)
+    out["label"] = out["var"].map(LABELS).fillna(out["var"])
+    return out.head(top_n)
+
+
+def plot_mdi_importance(model, out_png, top_n=30):
+    imp_df = collapse_mdi_by_variable(model, top_n=top_n)
+    plt.figure()
+    plt.barh(imp_df["label"][::-1], imp_df["imp"][::-1])
+    plt.title(f"RF importance (MDI), collapsed (Top {top_n})")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+# ============================================================
+# 6) CURVES: error vs trees, effect of mtry
+# ============================================================
+def plot_error_vs_trees(prep, X_train, y_train, X_test, y_test, postprocess, out_png,
+                        n_estimators_max=500, step=25, max_features=MAX_FEATURES_DEFAULT):
+    Xt = prep.transform(X_train)
+    Xte = prep.transform(X_test)
+    ytr = np.asarray(y_train)
+    yte = np.asarray(y_test)
+
+    rf = RandomForestRegressor(
+        n_estimators=step,
+        min_samples_leaf=MIN_SAMPLES_LEAF,
+        max_features=max_features,
+        bootstrap=True,
+        oob_score=True,
+        warm_start=True,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+    )
+
+    ns, oob_mse, te_mse = [], [], []
+    for n in range(step, n_estimators_max + 1, step):
+        rf.set_params(n_estimators=n)
+        rf.fit(Xt, ytr)
+
+        oob = rf.oob_prediction_
+        m = ~np.isnan(oob)
+        oob_pred = postprocess(oob[m])
+        ytr_m = ytr[m]
+        oob_mse.append(mean_squared_error(ytr_m, oob_pred))
+
+        pred_te = postprocess(rf.predict(Xte))
+        te_mse.append(mean_squared_error(yte, pred_te))
+        ns.append(n)
+
+    plt.figure()
+    plt.plot(ns, oob_mse, marker="o", linestyle="-", label="Out-of-bag MSE")
+    plt.plot(ns, te_mse, marker="o", linestyle="--", label="Holdout MSE")
+    plt.xlabel("trees")
+    plt.ylabel("MSE")
+    plt.title("Error vs number of trees")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+def plot_effect_mtry_auto(prep, X_train, y_train, X_test, y_test, postprocess, out_png,
+                          n_points=22, frac_min=0.02, frac_max=1.0, n_estimators=300):
+    """
+    Plots OOB and holdout MSE vs max_features = k, where k is the *actual number*
+    of features considered at each split (after one-hot expansion).
+
+    n_points=22  -> ~2x the density of your old grid (11 points)
+    frac_max=1.0 -> extends beyond 0.3 all the way to 100% to see stabilization
+    """
+    Xt = prep.transform(X_train)
+    Xte = prep.transform(X_test)
+    ytr = np.asarray(y_train)
+    yte = np.asarray(y_test)
+
+    p = Xt.shape[1]  # number of features AFTER preprocessing (incl. one-hot)
+
+    # Build a denser grid in terms of fractions, then convert to integer k
+    fracs = np.linspace(frac_min, frac_max, n_points)
+    k_grid = [max(1, int(f * p)) for f in fracs]
+
+    # Also force-in some classic reference points
+    k_grid += [
+        1, 2, 5, 10,
+        max(1, int(np.log2(p))),  # "log2"
+        max(1, int(np.sqrt(p))),  # "sqrt"
+        p  # all features
+    ]
+
+    # Deduplicate + clamp
+    k_grid = sorted(set(min(max(1, k), p) for k in k_grid))
+
+    oob_mse, te_mse = [], []
+    for k in k_grid:
+        rf = RandomForestRegressor(
+            n_estimators=n_estimators,
+            min_samples_leaf=MIN_SAMPLES_LEAF,
+            max_features=k,  # <-- ACTUAL NUMBER OF FEATURES
+            bootstrap=True,
+            oob_score=True,
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+        rf.fit(Xt, ytr)
+
+        oob = rf.oob_prediction_
+        m = ~np.isnan(oob)
+        oob_pred = postprocess(oob[m])
+        ytr_m = ytr[m]
+        oob_mse.append(mean_squared_error(ytr_m, oob_pred))
+
+        pred_te = postprocess(rf.predict(Xte))
+        te_mse.append(mean_squared_error(yte, pred_te))
+
+    plt.figure()
+    plt.plot(k_grid, oob_mse, marker="o", linestyle="-", label="Out-of-bag MSE")
+    plt.plot(k_grid, te_mse, marker="o", linestyle="--", label="Holdout MSE")
+    plt.xlabel(f"max_features = k (actual # features tried per split), p={p} after one-hot")
+    plt.ylabel("MSE")
+    plt.title("Effect of mtry / max_features (integer k-grid)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+
+# ============================================================
+# 7) CV runner (metrics across folds; OOB metrics on each fold train)
+# ============================================================
+def run_group_cv(spec_name, X, y, groups, postprocess):
+    splitter = LeaveOneGroupOut()
+    rows = []
+
+    for fold, (tr, te) in enumerate(splitter.split(X, y, groups=groups), start=1):
+        prep = make_preprocess(X.iloc[tr])
+        model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
         model.fit(X.iloc[tr], y.iloc[tr])
-        pred = model.predict(X.iloc[te])
 
-        rmse, mae, r2 = metrics_ratio(y.iloc[te], pred)
-        rmse_claim.append(rmse)
-        mae_claim.append(mae)
-        r2_claim.append(r2)
+        pred = postprocess(model.predict(X.iloc[te]))
+        y_te = np.asarray(y.iloc[te])
+        y_te_mean = float(np.mean(y_te))
+        y_te_std = float(np.std(y_te))
+        group_id = str(pd.Series(groups).iloc[te].astype("string").unique()[0])
 
-        rmse_group.append(group_weighted_rmse(y.iloc[te].to_numpy(), pred, groups.iloc[te]))
+        m_test = metrics_paper(y_te, pred)
+        err = y_te - pred
 
-    rmse_claim = np.array(rmse_claim)
-    mae_claim = np.array(mae_claim)
-    r2_claim = np.array(r2_claim)
-    rmse_group = np.array(rmse_group)
+        SSE = float(np.sum(err ** 2))
+        SAE = float(np.sum(np.abs(err)))
+        SBE = float(np.sum(pred - y_te))
 
-    print(f"Split type: REPEATED GROUPED holdout by {group_kind} ({group_col}) | #groups={groups.nunique()}")
-    print(f"Repetitions: R={R}, test_size={test_size}")
+        # Use fold mean baseline for SST (consistent with fold R2)
+        ybar = float(np.mean(y_te))
+        SST = float(np.sum((y_te - ybar) ** 2))
 
-    print("\n=== Claim-weighted performance (each claim weight=1) ===")
-    print(f"RMSE: mean={rmse_claim.mean():.4f}  sd={rmse_claim.std(ddof=1):.4f}  p10/p50/p90={np.quantile(rmse_claim,[.1,.5,.9])}")
-    print(f"MAE : mean={mae_claim.mean():.4f}  sd={mae_claim.std(ddof=1):.4f}  p10/p50/p90={np.quantile(mae_claim,[.1,.5,.9])}")
-    print(f"R^2 : mean={r2_claim.mean():.4f}  sd={r2_claim.std(ddof=1):.4f}  p10/p50/p90={np.quantile(r2_claim,[.1,.5,.9])}")
+        # Sufficient stats for pooled correlation
+        SUM_Y = float(np.sum(y_te))
+        SUM_P = float(np.sum(pred))
+        SUM_YY = float(np.sum(y_te ** 2))
+        SUM_PP = float(np.sum(pred ** 2))
+        SUM_YP = float(np.sum(y_te * pred))
+        base_pred = np.repeat(np.mean(y.iloc[tr]), len(te))
+        m_base = metrics_paper(y_te, base_pred)
 
-    print(f"\n=== {group_kind}-weighted RMSE (each {group_kind} weight=1) ===")
-    print(f"RMSE: mean={rmse_group.mean():.4f}  sd={rmse_group.std(ddof=1):.4f}  p10/p50/p90={np.quantile(rmse_group,[.1,.5,.9])}")
+        m_oob = oob_metrics_from_model(model, y_train=y.iloc[tr], postprocess=postprocess)
 
-else:
-    # --- time split evaluation (rolling-ish) ---
-    if year_col is None:
-        raise ValueError("No feasible event/state grouping and no yearOfLoss for a time split.")
+        rows.append({
+            "spec": spec_name,
+            "fold": fold,
+            "group_id": group_id,
+            "n_test": len(te),
+            "y_test_mean": y_te_mean,
+            "y_test_std": y_te_std,
+            "SSE": SSE, "SST": SST, "SAE": SAE, "SBE": SBE,
+            "SUM_Y": SUM_Y, "SUM_P": SUM_P, "SUM_YY": SUM_YY, "SUM_PP": SUM_PP, "SUM_YP": SUM_YP,
+            **{f"test_{k}": v for k, v in m_test.items()},
+            **{f"test_{k}": v for k, v in m_test.items()},
+            **{f"base_{k}": v for k, v in m_base.items()},
+            **{f"oob_{k}": v for k, v in m_oob.items()},
+        })
 
-    years = df.loc[X.index, year_col].astype(int)
-    uniq_years = np.sort(years.unique())
-    if len(uniq_years) < 3:
-        raise ValueError("Not enough years for meaningful time evaluation (need >= 3).")
+    return pd.DataFrame(rows)
 
-    # Evaluate on last ~20% of years one-by-one (train on all prior years)
-    start_test_pos = max(1, int(np.floor(0.8 * len(uniq_years))))
-    test_years = uniq_years[start_test_pos:]
 
-    rmse_list, mae_list, r2_list = [], [], []
+def run_random_cv(spec_name, X, y, postprocess, n_splits=5, test_size=0.2):
+    ss = ShuffleSplit(n_splits=n_splits, test_size=test_size, random_state=RANDOM_STATE)
+    rows = []
 
-    for ty in test_years:
-        tr = np.where(years < ty)[0]
-        te = np.where(years == ty)[0]
-        if len(te) == 0 or len(tr) == 0:
-            continue
-
+    for fold, (tr, te) in enumerate(ss.split(X, y), start=1):
+        prep = make_preprocess(X.iloc[tr])
+        model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
         model.fit(X.iloc[tr], y.iloc[tr])
-        pred = model.predict(X.iloc[te])
-        rmse, mae, r2 = metrics_ratio(y.iloc[te], pred)
 
-        rmse_list.append(rmse)
-        mae_list.append(mae)
-        r2_list.append(r2)
+        pred = postprocess(model.predict(X.iloc[te]))
+        y_te = np.asarray(y.iloc[te])
+        m_test = metrics_paper(y_te, pred)
+        y_te = np.asarray(y.iloc[te], dtype=float)
+        pred = np.asarray(postprocess(model.predict(X.iloc[te])), dtype=float)
 
-    rmse_list = np.array(rmse_list)
-    mae_list = np.array(mae_list)
-    r2_list = np.array(r2_list)
+        err = y_te - pred
 
-    print(f"Split type: TIME (train on past, test on year) by {year_col}")
-    print(f"Test years: {list(test_years)}")
+        SSE = float(np.sum(err ** 2))
+        SAE = float(np.sum(np.abs(err)))
+        SBE = float(np.sum(pred - y_te))
 
-    print("\n=== Year-by-year performance (damage ratio) ===")
-    print(f"RMSE: mean={rmse_list.mean():.4f}  sd={rmse_list.std(ddof=1):.4f}")
-    print(f"MAE : mean={mae_list.mean():.4f}  sd={mae_list.std(ddof=1):.4f}")
-    print(f"R^2 : mean={r2_list.mean():.4f}  sd={r2_list.std(ddof=1):.4f}")
+        # Use fold mean baseline for SST (consistent with fold R2)
+        ybar = float(np.mean(y_te))
+        SST = float(np.sum((y_te - ybar) ** 2))
 
+        # Sufficient stats for pooled correlation
+        SUM_Y = float(np.sum(y_te))
+        SUM_P = float(np.sum(pred))
+        SUM_YY = float(np.sum(y_te ** 2))
+        SUM_PP = float(np.sum(pred ** 2))
+        SUM_YP = float(np.sum(y_te * pred))
+
+        base_pred = np.repeat(np.mean(y.iloc[tr]), len(te))
+        m_base = metrics_paper(y_te, base_pred)
+
+        m_oob = oob_metrics_from_model(model, y_train=y.iloc[tr], postprocess=postprocess)
+
+        rows.append({
+            "spec": spec_name,
+            "fold": fold,
+            "n_test": len(te),
+
+            "SSE": SSE, "SST": SST, "SAE": SAE, "SBE": SBE,
+            "SUM_Y": SUM_Y, "SUM_P": SUM_P, "SUM_YY": SUM_YY, "SUM_PP": SUM_PP, "SUM_YP": SUM_YP,
+            **{f"test_{k}": v for k, v in m_test.items()},
+            **{f"base_{k}": v for k, v in m_base.items()},
+            **{f"oob_{k}": v for k, v in m_oob.items()},
+        })
+
+    return pd.DataFrame(rows), ss
+
+
+def pooled_from_folds(df_folds):
+    N = float(df_folds["n_test"].sum())
+
+    SSE = float(df_folds["SSE"].sum())
+    SST = float(df_folds["SST"].sum())
+    SAE = float(df_folds["SAE"].sum())
+    SBE = float(df_folds["SBE"].sum())
+
+    # pooled point metrics
+    rmse = float(np.sqrt(SSE / N))
+    mae = float(SAE / N)
+    mbe = float(SBE / N)
+    r2 = float(1.0 - SSE / SST) if SST > 0 else np.nan
+
+    # pooled correlation from sufficient stats
+    sum_y = float(df_folds["SUM_Y"].sum())
+    sum_p = float(df_folds["SUM_P"].sum())
+    sum_yy = float(df_folds["SUM_YY"].sum())
+    sum_pp = float(df_folds["SUM_PP"].sum())
+    sum_yp = float(df_folds["SUM_YP"].sum())
+
+    cov = sum_yp - (sum_y * sum_p) / N
+    var_y = sum_yy - (sum_y * sum_y) / N
+    var_p = sum_pp - (sum_p * sum_p) / N
+    corr = float(cov / np.sqrt(var_y * var_p)) if (var_y > 0 and var_p > 0) else np.nan
+
+    mean_y = sum_y / N
+    mae_norm = float(mae / mean_y) if mean_y != 0 else np.nan
+    mbe_norm = float(mbe / mean_y) if mean_y != 0 else np.nan
+
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "mbe": mbe,
+        "r2": r2,
+        "corr": corr,
+        "mae_norm": mae_norm,
+        "mbe_norm": mbe_norm,
+    }
+
+
+# ============================================================
+# 8) Representative split selection for importance + curves
+# ============================================================
+def representative_holdout_event(groups_event):
+    counts = pd.Series(groups_event).value_counts()
+    holdout = counts.index[0]
+    te_mask = (groups_event == holdout).to_numpy()
+    tr_idx = np.where(~te_mask)[0]
+    te_idx = np.where(te_mask)[0]
+    return tr_idx, te_idx, str(holdout)
+
+
+def representative_holdout_state(groups_state):
+    counts = pd.Series(groups_state).value_counts()
+    holdout = counts.index[0]
+    te_mask = (groups_state == holdout).to_numpy()
+    tr_idx = np.where(~te_mask)[0]
+    te_idx = np.where(te_mask)[0]
+    return tr_idx, te_idx, str(holdout)
+
+
+# ============================================================
+# 9) MAIN
+# ============================================================
+def main():
+    df = pd.read_csv(DATA_PATH, low_memory=False)
+    summary_rows = []
+    times = {}
+    for target_kind in ["ratio", "log_damage"]:
+        start_0 = tm.time()
+        X, y, groups_event, groups_state = build_dataset(df, target_kind)
+        postprocess = postprocess_fn(target_kind)
+
+        target_dir = os.path.join(OUT_DIR, target_kind)
+        os.makedirs(target_dir, exist_ok=True)
+
+        # ----------------------------
+        # FULL-DATA OOB baseline
+        # ----------------------------
+        prep_full = make_preprocess(X)
+        model_full = make_model(prep_full, max_features=MAX_FEATURES_DEFAULT)
+        model_full.fit(X, y)
+        m_full_oob = oob_metrics_from_model(model_full, y_train=y, postprocess=postprocess)
+
+        summary_rows.append({"target": target_kind, "spec": "FULL_OOB", **m_full_oob})
+        print(f"[{target_kind}] FULL_OOB:", m_full_oob)
+        end = tm.time()
+        times[f"{target_kind}_full_oob"] = end - start_0
+        print(f"[{target_kind}] Baseline: {end - start_0:.1f} sec, n={len(y)}, p={X.shape[1]}")
+        # ----------------------------
+        # LOEO_event CV (metrics)
+        # ----------------------------
+        if groups_event is not None and pd.Series(groups_event).nunique() >= 2:
+            start = tm.time()
+            df_loeo = run_group_cv("LOEO_event", X, y, groups_event, postprocess)
+            df_loeo.to_csv(os.path.join(target_dir, "folds_LOEO_event.csv"), index=False)
+
+            pooled = pooled_from_folds(df_loeo)
+            summary_rows.append({"target": target_kind, "spec": "LOEO_event_pooled", **pooled})
+
+            tr, te, holdout_id = representative_holdout_event(groups_event)
+            prep = make_preprocess(X.iloc[tr])
+            model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
+            model.fit(X.iloc[tr], y.iloc[tr])
+            end = tm.time()
+            times[f"{target_kind}_loeo_event"] = end - start
+            print(f"[{target_kind}] LOEO_event: {end - start:.1f} sec")
+            if replicate_whole:
+                start = tm.time()
+                plot_varimp_percent_inc_mse(
+                    model, X.iloc[te], y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, f"imp_LOEO_event_holdout_{holdout_id}_pctIncMSE.png"),
+                    top_n=20, n_repeats=5
+                )
+                plot_mdi_importance(
+                    model,
+                    out_png=os.path.join(target_dir, f"imp_LOEO_event_holdout_{holdout_id}_MDI.png"),
+                    top_n=30
+                )
+
+                plot_error_vs_trees(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir,
+                                         f"curve_LOEO_event_holdout_{holdout_id}_error_vs_trees.png"),
+                    n_estimators_max=500, step=25
+                )
+
+                plot_effect_mtry_auto(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
+                    n_points=22,  # ~2x points vs before
+                    frac_min=0.02,
+                    frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
+                    n_estimators=300
+                )
+                end = tm.time()
+                times[f"{target_kind}_loeo_event_importance_curves"] = end - start
+                print(f"[{target_kind}] LOEO_event importance + curves: {end - start:.1f} sec")
+
+        # ----------------------------
+        # LOSO_state CV (metrics)
+        # ----------------------------
+        if groups_state is not None and pd.Series(groups_state).nunique() >= 2:
+            start = tm.time()
+            df_loso = run_group_cv("LOSO_state", X, y, groups_state, postprocess)
+            SSE = df_loso["SSE"].sum()
+            SST = df_loso["SST"].sum()
+            r2_pooled = 1 - SSE / SST
+            rmse_pooled = np.sqrt(SSE / df_loso["n_test"].sum())
+            print("POOLED LOSO R2:", r2_pooled, "POOLED RMSE:", rmse_pooled)
+
+            # find worst states
+            print(df_loso.sort_values("test_r2").head(10)[
+                      ["group_id", "n_test", "y_test_mean", "y_test_std", "test_r2", "test_mae", "test_mbe"]
+                  ])
+            df_loso.to_csv(os.path.join(target_dir, "folds_LOSO_state.csv"), index=False)
+
+            pooled = pooled_from_folds(df_loso)
+            summary_rows.append({"target": target_kind, "spec": "LOSO_state_pooled", **pooled})
+
+            tr, te, holdout_id = representative_holdout_state(groups_state)
+            prep = make_preprocess(X.iloc[tr])
+            model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
+            model.fit(X.iloc[tr], y.iloc[tr])
+            end = tm.time()
+            times[f"{target_kind}_loso_state"] = end - start
+            print(f"[{target_kind}] LOSO_state: {end - start:.1f} sec")
+            if replicate_whole:
+                start = tm.time()
+                plot_varimp_percent_inc_mse(
+                    model, X.iloc[te], y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, f"imp_LOSO_state_holdout_{holdout_id}_pctIncMSE.png"),
+                    top_n=20, n_repeats=5
+                )
+                plot_mdi_importance(
+                    model,
+                    out_png=os.path.join(target_dir, f"imp_LOSO_state_holdout_{holdout_id}_MDI.png"),
+                    top_n=30
+                )
+
+                plot_error_vs_trees(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir,
+                                         f"curve_LOSO_state_holdout_{holdout_id}_error_vs_trees.png"),
+                    n_estimators_max=500, step=25
+                )
+
+                plot_effect_mtry_auto(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
+                    n_points=22,  # ~2x points vs before
+                    frac_min=0.02,
+                    frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
+                    n_estimators=300
+                )
+                end = tm.time()
+                times[f"{target_kind}_loso_state_importance_curves"] = end - start
+                print(f"[{target_kind}] LOSO_state importance + curves: {end - start:.1f} sec")
+        # ----------------------------
+        # Random 80/20 CV (metrics + first split importance)
+        # ----------------------------
+        start = tm.time()
+        df_rand, ss = run_random_cv("Random_80_20", X, y, postprocess, n_splits=5, test_size=0.2)
+        df_rand.to_csv(os.path.join(target_dir, "folds_Random_80_20.csv"), index=False)
+
+        pooled = pooled_from_folds(df_rand)
+        summary_rows.append({"target": target_kind, "spec": "Random_80_20_pooled", **pooled})
+
+        tr, te = next(ss.split(X, y))
+        prep = make_preprocess(X.iloc[tr])
+        model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
+        model.fit(X.iloc[tr], y.iloc[tr])
+        end = tm.time()
+        print(f"[{target_kind}] Random_80_20: {end - start:.1f} sec")
+        if replicate_whole:
+            start = tm.time()
+            plot_varimp_percent_inc_mse(
+                model, X.iloc[te], y.iloc[te],
+                postprocess=postprocess,
+                out_png=os.path.join(target_dir, "imp_Random_80_20_pctIncMSE.png"),
+                top_n=20, n_repeats=5
+            )
+            plot_mdi_importance(
+                model,
+                out_png=os.path.join(target_dir, "imp_Random_80_20_MDI.png"),
+                top_n=30
+            )
+
+            plot_error_vs_trees(
+                prep=model.named_steps["prep"],
+                X_train=X.iloc[tr], y_train=y.iloc[tr],
+                X_test=X.iloc[te], y_test=y.iloc[te],
+                postprocess=postprocess,
+                out_png=os.path.join(target_dir, "curve_Random_80_20_error_vs_trees.png"),
+                n_estimators_max=500, step=25
+            )
+
+            plot_effect_mtry_auto(
+                prep=model.named_steps["prep"],
+                X_train=X.iloc[tr], y_train=y.iloc[tr],
+                X_test=X.iloc[te], y_test=y.iloc[te],
+                postprocess=postprocess,
+                out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
+                n_points=22,  # ~2x points vs before
+                frac_min=0.02,
+                frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
+                n_estimators=300
+            )
+            end = tm.time()
+            times[f"{target_kind}_random_80_20_importance_curves"] = end - start
+            print(f"[{target_kind}] Random_80_20 importance + curves: {end - start:.1f} sec")
+    end_all = tm.time()
+    times[f"{target_kind}_total"] = end_all - start_0
+    times_summary = pd.DataFrame([
+        {"step": k, "time_sec": v, "time_min": v / 60.0, "time_hr": v / 3600.0}
+        for k, v in times.items()
+    ])
+    print(times_summary)
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(os.path.join(OUT_DIR, "summary_specs_targets.csv"), index=False)
+    print("\nSaved summary:", os.path.join(OUT_DIR, "summary_specs_targets.csv"))
+    print(summary.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

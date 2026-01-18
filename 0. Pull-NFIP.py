@@ -31,11 +31,8 @@ FIELDS = [
     'totalContentsInsuranceCoverage', 'waterDepth', 'yearOfLoss'
 ]
 
-DROP = {
-    "asOfDate", "dateOfLoss", "yearOfLoss"
-}
 
-FIELDS_MINUS = [f for f in FIELDS if f not in DROP]
+FIELDS_MINUS = [f for f in FIELDS]
 
 def build_filter(year: int,
                  states=None,
@@ -113,15 +110,12 @@ def fetch_nfip_claims(year: int,
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Convenient totals
-    if {"netBuildingPaymentAmount","netContentsPaymentAmount","netIccPaymentAmount"}.issubset(df.columns):
+    if {"netBuildingPaymentAmount", "netContentsPaymentAmount","netIccPaymentAmount"}.issubset(df.columns):
         df["paid_total_net"] = (
             df["netBuildingPaymentAmount"].fillna(0)
             + df["netContentsPaymentAmount"].fillna(0)
             + df["netIccPaymentAmount"].fillna(0)
         )
-
-    if {"buildingDamageAmount","contentsDamageAmount"}.issubset(df.columns):
-        df["damage_total"] = df["buildingDamageAmount"].fillna(0) + df["contentsDamageAmount"].fillna(0)
 
     return df
 
@@ -140,5 +134,5 @@ if __name__ == "__main__":
     )
     print(df.shape)
     print(df.head(3))
-    df.to_csv("nfip_claims_FL_2020.csv", index=False)
+    df.to_csv("nfip_claims_ALL_STATES_2020.csv", index=False)
     print("Saved nfip_claims_FL_2020.csv")
