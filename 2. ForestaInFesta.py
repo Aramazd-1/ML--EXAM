@@ -18,7 +18,7 @@ DATA_PATH = "nfip_claims_ALL_STATES_2020.csv"  # <-- set this
 OUT_DIR = "rf_outputs_nfip_clean"
 os.makedirs(OUT_DIR, exist_ok=True)
 RANDOM_STATE = 42
-replicate_whole = False  # Disables replication of the diagnostic and tuning plots
+
 # Extended labels (covers ALL FIELDS; you can shorten/rename anytime)
 LABELS = {
     "agricultureStructureIndicator": "Agriculture structure (indicator)",
@@ -127,8 +127,7 @@ FIELDS_MINUS = [f for f in FIELDS if f not in DROP]
 
 NUM_LIKE = [
     "buildingDamageAmount", "contentsDamageAmount",
-    "buildingReplacementCost", "contentsReplacementCost",
-    "buildingPropertyValue", "contentsPropertyValue",
+    "buildingReplacementCost", "contentsReplacementCost", "contentsPropertyValue",
     "totalBuildingInsuranceCoverage", "totalContentsInsuranceCoverage",
     "waterDepth", "floodWaterDuration",
     "baseFloodElevation", "elevationDifference", "lowestAdjacentGrade", "lowestFloorElevation",
@@ -145,6 +144,7 @@ LEAKAGE_COLS = [
     "netIccPaymentAmount",
     "nonPaymentReasonBuilding",
     "nonPaymentReasonContents",
+    "buildingPropertyValue",
 ]
 
 ID_COLS = ["id"]
@@ -153,6 +153,29 @@ ID_COLS = ["id"]
 N_ESTIMATORS = 200  # Trees used in the estimation
 MIN_SAMPLES_LEAF = 20   # Minimum samples per leaf
 MAX_FEATURES_DEFAULT = 0.3  # fraction of features to consider at each split
+
+# ============================================================
+# 0b) WHICH ESTIMATES TO RUN (you said you already have these)
+# ============================================================
+DO_FULL_OOB = True
+DO_LOEO_EVENT = True
+DO_LOSO_STATE = True
+DO_RANDOM_80_20 = True
+
+# ============================================================
+# 0c) WHICH FEATURE-SPECS TO RUN (NEW)
+# ============================================================
+RUN_RATIO_BASE = True
+RUN_LOG_BASE = True
+RUN_LOG_NO_REPL_COST = True  # log_damage but drop repl costs from X
+
+# ============================================================
+# 0d) DIAGNOSTICS PER FEATURE-SPEC (NEW)
+# (master switch still replicate_whole)
+# ============================================================
+DIAG_RATIO_BASE = True
+DIAG_LOG_BASE = True
+DIAG_LOG_NO_REPL_COST = True
 
 
 # ============================================================
@@ -248,7 +271,8 @@ def postprocess_fn(target_kind: str):
 # ============================================================
 # 3) DATASET BUILDER
 # ============================================================
-def build_dataset(df: pd.DataFrame, target_kind: str):
+def build_dataset(df: pd.DataFrame, target_kind: str, extra_drop_X=None):
+    extra_drop_X = extra_drop_X or []
     use_cols = [c for c in FIELDS_MINUS if c in df.columns]
     df_use = df[use_cols].copy()
 
@@ -298,7 +322,7 @@ def build_dataset(df: pd.DataFrame, target_kind: str):
     if "state" in df_use.columns:
         groups_state = df_use.loc[mask, "state"].astype("string").fillna("MISSING")
 
-    drop_cols = [c for c in (LEAKAGE_COLS + ID_COLS + target_drop) if c in df_use.columns]
+    drop_cols = [c for c in (LEAKAGE_COLS + ID_COLS + target_drop + list(extra_drop_X)) if c in df_use.columns]
     X = df_use.loc[mask].drop(columns=drop_cols).copy()
 
     # remove group cols from X
@@ -511,7 +535,7 @@ def plot_effect_mtry_auto(prep, X_train, y_train, X_test, y_test, postprocess, o
     plt.plot(k_grid, te_mse, marker="o", linestyle="--", label="Holdout MSE")
     plt.xlabel(f"max_features = k (actual # features tried per split), p={p} after one-hot")
     plt.ylabel("MSE")
-    plt.title("Effect of mtry / max_features (integer k-grid)")
+    plt.title("Error Vs maximum number of features (integer k-grid)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=200)
@@ -689,54 +713,110 @@ def representative_holdout_state(groups_state):
     te_idx = np.where(te_mask)[0]
     return tr_idx, te_idx, str(holdout)
 
+SUMMARY_PATH = os.path.join(OUT_DIR, "summary_specs_targets.csv")
+
+def upsert_summary_csv(path: str, new_rows: pd.DataFrame, key_cols=("target", "feat_spec", "spec")):
+    # new_rows must include key cols
+    for c in key_cols:
+        if c not in new_rows.columns:
+            raise ValueError(f"new_rows is missing required key column: {c}")
+
+    if os.path.exists(path):
+        old = pd.read_csv(path)
+        if "feat_spec" not in old.columns:
+            old["feat_spec"] = "BASE"
+        # backward compat if you previously wrote without feat_spec
+        if "feat_spec" not in old.columns:
+            old["feat_spec"] = "BASE"
+
+        combo = pd.concat([old, new_rows], ignore_index=True, sort=False)
+        combo = combo.drop_duplicates(subset=list(key_cols), keep="last")
+    else:
+        combo = new_rows.copy()
+
+    combo.to_csv(path, index=False)
+    return combo
+
 
 # ============================================================
 # 9) MAIN
 # ============================================================
 def main():
     df = pd.read_csv(DATA_PATH, low_memory=False)
-    summary_rows = []
-    times = {}
-    for target_kind in ["ratio", "log_damage"]:
+    SPECS = [
+        ("ratio", "BASE", RUN_RATIO_BASE, DIAG_RATIO_BASE, []),
+        ("log_damage", "BASE", RUN_LOG_BASE, DIAG_LOG_BASE, []),
+        ("log_damage", "NO_REPL_COST", RUN_LOG_NO_REPL_COST, DIAG_LOG_NO_REPL_COST,
+         ["buildingReplacementCost", "contentsReplacementCost"]),
+    ]
+
+    # Summary file path
+    summary_path = os.path.join(OUT_DIR, "summary_specs_targets.csv")
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    for target_kind, feat_spec, RUN_THIS, RUN_DIAG, extra_drop_X in SPECS:
+        if not RUN_THIS:
+            continue
+
+        # per-spec collectors
+        summary_rows_spec = []
+        times = {}
+
         start_0 = tm.time()
-        X, y, groups_event, groups_state = build_dataset(df, target_kind)
+        X, y, groups_event, groups_state = build_dataset(df, target_kind, extra_drop_X=extra_drop_X)
         postprocess = postprocess_fn(target_kind)
 
-        target_dir = os.path.join(OUT_DIR, target_kind)
+        # separate folder for each target+feat_spec
+        target_dir = os.path.join(OUT_DIR, target_kind, feat_spec)
         os.makedirs(target_dir, exist_ok=True)
 
-        # ----------------------------
+        # ============================================================
         # FULL-DATA OOB baseline
-        # ----------------------------
-        prep_full = make_preprocess(X)
-        model_full = make_model(prep_full, max_features=MAX_FEATURES_DEFAULT)
-        model_full.fit(X, y)
-        m_full_oob = oob_metrics_from_model(model_full, y_train=y, postprocess=postprocess)
+        # ============================================================
+        if DO_FULL_OOB:
+            prep_full = make_preprocess(X)
+            model_full = make_model(prep_full, max_features=MAX_FEATURES_DEFAULT)
+            model_full.fit(X, y)
+            m_full_oob = oob_metrics_from_model(model_full, y_train=y, postprocess=postprocess)
 
-        summary_rows.append({"target": target_kind, "spec": "FULL_OOB", **m_full_oob})
-        print(f"[{target_kind}] FULL_OOB:", m_full_oob)
-        end = tm.time()
-        times[f"{target_kind}_full_oob"] = end - start_0
-        print(f"[{target_kind}] Baseline: {end - start_0:.1f} sec, n={len(y)}, p={X.shape[1]}")
-        # ----------------------------
+            summary_rows_spec.append({
+                "target": target_kind,
+                "feat_spec": feat_spec,
+                "spec": "FULL_OOB",
+                **m_full_oob
+            })
+            print(f"[{target_kind} | {feat_spec}] FULL_OOB:", m_full_oob)
+
+            end = tm.time()
+            times[f"{target_kind}__{feat_spec}__full_oob"] = end - start_0
+            print(f"[{target_kind} | {feat_spec}] Baseline: {end - start_0:.1f} sec, n={len(y)}, p={X.shape[1]}")
+
+        # ============================================================
         # LOEO_event CV (metrics)
-        # ----------------------------
-        if groups_event is not None and pd.Series(groups_event).nunique() >= 2:
+        # ============================================================
+        if DO_LOEO_EVENT and (groups_event is not None) and (pd.Series(groups_event).nunique() >= 2):
             start = tm.time()
             df_loeo = run_group_cv("LOEO_event", X, y, groups_event, postprocess)
             df_loeo.to_csv(os.path.join(target_dir, "folds_LOEO_event.csv"), index=False)
 
             pooled = pooled_from_folds(df_loeo)
-            summary_rows.append({"target": target_kind, "spec": "LOEO_event_pooled", **pooled})
+            summary_rows_spec.append({
+                "target": target_kind,
+                "feat_spec": feat_spec,
+                "spec": "LOEO_event_pooled",
+                **pooled
+            })
 
             tr, te, holdout_id = representative_holdout_event(groups_event)
             prep = make_preprocess(X.iloc[tr])
             model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
             model.fit(X.iloc[tr], y.iloc[tr])
+
             end = tm.time()
-            times[f"{target_kind}_loeo_event"] = end - start
-            print(f"[{target_kind}] LOEO_event: {end - start:.1f} sec")
-            if replicate_whole:
+            times[f"{target_kind}__{feat_spec}__loeo_event"] = end - start
+            print(f"[{target_kind} | {feat_spec}] LOEO_event: {end - start:.1f} sec")
+
+            if RUN_DIAG:
                 start = tm.time()
                 plot_varimp_percent_inc_mse(
                     model, X.iloc[te], y.iloc[te],
@@ -749,7 +829,6 @@ def main():
                     out_png=os.path.join(target_dir, f"imp_LOEO_event_holdout_{holdout_id}_MDI.png"),
                     top_n=30
                 )
-
                 plot_error_vs_trees(
                     prep=model.named_steps["prep"],
                     X_train=X.iloc[tr], y_train=y.iloc[tr],
@@ -759,51 +838,58 @@ def main():
                                          f"curve_LOEO_event_holdout_{holdout_id}_error_vs_trees.png"),
                     n_estimators_max=500, step=25
                 )
-
                 plot_effect_mtry_auto(
                     prep=model.named_steps["prep"],
                     X_train=X.iloc[tr], y_train=y.iloc[tr],
                     X_test=X.iloc[te], y_test=y.iloc[te],
                     postprocess=postprocess,
-                    out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
-                    n_points=22,  # ~2x points vs before
+                    out_png=os.path.join(target_dir, f"curve_LOEO_event_holdout_{holdout_id}_effect_mtry.png"),
+                    n_points=22,
                     frac_min=0.02,
-                    frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
+                    frac_max=1.0,
                     n_estimators=300
                 )
                 end = tm.time()
-                times[f"{target_kind}_loeo_event_importance_curves"] = end - start
-                print(f"[{target_kind}] LOEO_event importance + curves: {end - start:.1f} sec")
+                times[f"{target_kind}__{feat_spec}__loeo_event_diag"] = end - start
+                print(f"[{target_kind} | {feat_spec}] LOEO_event diagnostics: {end - start:.1f} sec")
 
-        # ----------------------------
+        # ============================================================
         # LOSO_state CV (metrics)
-        # ----------------------------
-        if groups_state is not None and pd.Series(groups_state).nunique() >= 2:
+        # ============================================================
+        if DO_LOSO_STATE and (groups_state is not None) and (pd.Series(groups_state).nunique() >= 2):
             start = tm.time()
             df_loso = run_group_cv("LOSO_state", X, y, groups_state, postprocess)
+
+            # optional prints you had
             SSE = df_loso["SSE"].sum()
             SST = df_loso["SST"].sum()
-            r2_pooled = 1 - SSE / SST
+            r2_pooled = 1 - SSE / SST if SST != 0 else np.nan
             rmse_pooled = np.sqrt(SSE / df_loso["n_test"].sum())
-            print("POOLED LOSO R2:", r2_pooled, "POOLED RMSE:", rmse_pooled)
-
-            # find worst states
+            print(f"[{target_kind} | {feat_spec}] POOLED LOSO R2:", r2_pooled, "POOLED RMSE:", rmse_pooled)
             print(df_loso.sort_values("test_r2").head(10)[
-                      ["group_id", "n_test", "y_test_mean", "y_test_std", "test_r2", "test_mae", "test_mbe"]
-                  ])
+                ["group_id", "n_test", "y_test_mean", "y_test_std", "test_r2", "test_mae", "test_mbe"]
+            ])
+
             df_loso.to_csv(os.path.join(target_dir, "folds_LOSO_state.csv"), index=False)
 
             pooled = pooled_from_folds(df_loso)
-            summary_rows.append({"target": target_kind, "spec": "LOSO_state_pooled", **pooled})
+            summary_rows_spec.append({
+                "target": target_kind,
+                "feat_spec": feat_spec,
+                "spec": "LOSO_state_pooled",
+                **pooled
+            })
 
             tr, te, holdout_id = representative_holdout_state(groups_state)
             prep = make_preprocess(X.iloc[tr])
             model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
             model.fit(X.iloc[tr], y.iloc[tr])
+
             end = tm.time()
-            times[f"{target_kind}_loso_state"] = end - start
-            print(f"[{target_kind}] LOSO_state: {end - start:.1f} sec")
-            if replicate_whole:
+            times[f"{target_kind}__{feat_spec}__loso_state"] = end - start
+            print(f"[{target_kind} | {feat_spec}] LOSO_state: {end - start:.1f} sec")
+
+            if RUN_DIAG:
                 start = tm.time()
                 plot_varimp_percent_inc_mse(
                     model, X.iloc[te], y.iloc[te],
@@ -816,7 +902,6 @@ def main():
                     out_png=os.path.join(target_dir, f"imp_LOSO_state_holdout_{holdout_id}_MDI.png"),
                     top_n=30
                 )
-
                 plot_error_vs_trees(
                     prep=model.named_steps["prep"],
                     X_train=X.iloc[tr], y_train=y.iloc[tr],
@@ -826,85 +911,113 @@ def main():
                                          f"curve_LOSO_state_holdout_{holdout_id}_error_vs_trees.png"),
                     n_estimators_max=500, step=25
                 )
-
                 plot_effect_mtry_auto(
                     prep=model.named_steps["prep"],
                     X_train=X.iloc[tr], y_train=y.iloc[tr],
                     X_test=X.iloc[te], y_test=y.iloc[te],
                     postprocess=postprocess,
-                    out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
-                    n_points=22,  # ~2x points vs before
+                    out_png=os.path.join(target_dir, f"curve_LOSO_state_holdout_{holdout_id}_effect_mtry.png"),
+                    n_points=22,
                     frac_min=0.02,
-                    frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
+                    frac_max=1.0,
                     n_estimators=300
                 )
                 end = tm.time()
-                times[f"{target_kind}_loso_state_importance_curves"] = end - start
-                print(f"[{target_kind}] LOSO_state importance + curves: {end - start:.1f} sec")
-        # ----------------------------
+                times[f"{target_kind}__{feat_spec}__loso_state_diag"] = end - start
+                print(f"[{target_kind} | {feat_spec}] LOSO_state diagnostics: {end - start:.1f} sec")
+
+        # ============================================================
         # Random 80/20 CV (metrics + first split importance)
-        # ----------------------------
-        start = tm.time()
-        df_rand, ss = run_random_cv("Random_80_20", X, y, postprocess, n_splits=5, test_size=0.2)
-        df_rand.to_csv(os.path.join(target_dir, "folds_Random_80_20.csv"), index=False)
-
-        pooled = pooled_from_folds(df_rand)
-        summary_rows.append({"target": target_kind, "spec": "Random_80_20_pooled", **pooled})
-
-        tr, te = next(ss.split(X, y))
-        prep = make_preprocess(X.iloc[tr])
-        model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
-        model.fit(X.iloc[tr], y.iloc[tr])
-        end = tm.time()
-        print(f"[{target_kind}] Random_80_20: {end - start:.1f} sec")
-        if replicate_whole:
+        # ============================================================
+        if DO_RANDOM_80_20:
             start = tm.time()
-            plot_varimp_percent_inc_mse(
-                model, X.iloc[te], y.iloc[te],
-                postprocess=postprocess,
-                out_png=os.path.join(target_dir, "imp_Random_80_20_pctIncMSE.png"),
-                top_n=20, n_repeats=5
-            )
-            plot_mdi_importance(
-                model,
-                out_png=os.path.join(target_dir, "imp_Random_80_20_MDI.png"),
-                top_n=30
-            )
+            df_rand, ss = run_random_cv("Random_80_20", X, y, postprocess, n_splits=5, test_size=0.2)
+            df_rand.to_csv(os.path.join(target_dir, "folds_Random_80_20.csv"), index=False)
 
-            plot_error_vs_trees(
-                prep=model.named_steps["prep"],
-                X_train=X.iloc[tr], y_train=y.iloc[tr],
-                X_test=X.iloc[te], y_test=y.iloc[te],
-                postprocess=postprocess,
-                out_png=os.path.join(target_dir, "curve_Random_80_20_error_vs_trees.png"),
-                n_estimators_max=500, step=25
-            )
+            pooled = pooled_from_folds(df_rand)
+            summary_rows_spec.append({
+                "target": target_kind,
+                "feat_spec": feat_spec,
+                "spec": "Random_80_20_pooled",
+                **pooled
+            })
 
-            plot_effect_mtry_auto(
-                prep=model.named_steps["prep"],
-                X_train=X.iloc[tr], y_train=y.iloc[tr],
-                X_test=X.iloc[te], y_test=y.iloc[te],
-                postprocess=postprocess,
-                out_png=os.path.join(target_dir, f"curve_..._effect_mtry.png"),
-                n_points=22,  # ~2x points vs before
-                frac_min=0.02,
-                frac_max=1.0,  # <-- extends beyond 0.3 to see stabilization
-                n_estimators=300
-            )
+            tr, te = next(ss.split(X, y))
+            prep = make_preprocess(X.iloc[tr])
+            model = make_model(prep, max_features=MAX_FEATURES_DEFAULT)
+            model.fit(X.iloc[tr], y.iloc[tr])
+
             end = tm.time()
-            times[f"{target_kind}_random_80_20_importance_curves"] = end - start
-            print(f"[{target_kind}] Random_80_20 importance + curves: {end - start:.1f} sec")
-    end_all = tm.time()
-    times[f"{target_kind}_total"] = end_all - start_0
-    times_summary = pd.DataFrame([
-        {"step": k, "time_sec": v, "time_min": v / 60.0, "time_hr": v / 3600.0}
-        for k, v in times.items()
-    ])
-    print(times_summary)
-    summary = pd.DataFrame(summary_rows)
-    summary.to_csv(os.path.join(OUT_DIR, "summary_specs_targets.csv"), index=False)
-    print("\nSaved summary:", os.path.join(OUT_DIR, "summary_specs_targets.csv"))
-    print(summary.to_string(index=False))
+            times[f"{target_kind}__{feat_spec}__random_80_20"] = end - start
+            print(f"[{target_kind} | {feat_spec}] Random_80_20: {end - start:.1f} sec")
+
+            if  RUN_DIAG:
+                start = tm.time()
+                plot_varimp_percent_inc_mse(
+                    model, X.iloc[te], y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, "imp_Random_80_20_pctIncMSE.png"),
+                    top_n=20, n_repeats=5
+                )
+                plot_mdi_importance(
+                    model,
+                    out_png=os.path.join(target_dir, "imp_Random_80_20_MDI.png"),
+                    top_n=30
+                )
+                plot_error_vs_trees(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, "curve_Random_80_20_error_vs_trees.png"),
+                    n_estimators_max=500, step=25
+                )
+                plot_effect_mtry_auto(
+                    prep=model.named_steps["prep"],
+                    X_train=X.iloc[tr], y_train=y.iloc[tr],
+                    X_test=X.iloc[te], y_test=y.iloc[te],
+                    postprocess=postprocess,
+                    out_png=os.path.join(target_dir, "curve_Random_80_20_effect_mtry.png"),
+                    n_points=22,
+                    frac_min=0.02,
+                    frac_max=1.0,
+                    n_estimators=300
+                )
+                end = tm.time()
+                times[f"{target_kind}__{feat_spec}__random_80_20_diag"] = end - start
+                print(f"[{target_kind} | {feat_spec}] Random_80_20 diagnostics: {end - start:.1f} sec")
+
+        # ============================================================
+        # WRITE / UPSERT SUMMARY FOR THIS SPEC (MODULAR RUNS)
+        # ============================================================
+        times[f"{target_kind}__{feat_spec}__total"] = tm.time() - start_0
+        times_summary = pd.DataFrame([
+            {"step": k, "time_sec": v, "time_min": v / 60.0, "time_hr": v / 3600.0}
+            for k, v in times.items()
+        ])
+        print(times_summary)
+
+        new_rows = pd.DataFrame(summary_rows_spec)
+
+        # If nothing ran, skip upsert
+        if len(new_rows) == 0:
+            print(f"[{target_kind} | {feat_spec}] Nothing to write (all DO_* toggles off).")
+            continue
+
+        # This function must exist in your script (you said you added it)
+        summary_all = upsert_summary_csv(
+            summary_path,
+            new_rows,
+            key_cols=("target", "feat_spec", "spec")
+        )
+
+        print("\nUpdated summary:", summary_path)
+        print(summary_all.sort_values(["target", "feat_spec", "spec"]).to_string(index=False))
+
+    if os.path.exists(summary_path):
+        final = pd.read_csv(summary_path)
+        print("\nFINAL summary:", summary_path)
+        print(final.sort_values(["target", "feat_spec", "spec"]).to_string(index=False))
 
 
 if __name__ == "__main__":

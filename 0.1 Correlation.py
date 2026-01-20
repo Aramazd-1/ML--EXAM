@@ -128,6 +128,18 @@ FIELDS = [
 ]
 DROP = {"asOfDate", "dateOfLoss", "yearOfLoss"}
 FIELDS_MINUS = [f for f in FIELDS if f not in DROP]
+LEAKAGE_COLS = [
+    "amountPaidOnBuildingClaim",
+    "amountPaidOnContentsClaim",
+    "amountPaidOnIncreasedCostOfComplianceClaim",
+    "netBuildingPaymentAmount",
+    "netContentsPaymentAmount",
+    "netIccPaymentAmount",
+    "nonPaymentReasonBuilding",
+    "nonPaymentReasonContents",
+    "buildingPropertyValue",
+]
+FIELDS_MINUS_leak = [f for f in FIELDS_MINUS if f not in LEAKAGE_COLS]
 
 # Cap very-high-cardinality categoricals to keep computations tractable
 MAX_LEVELS_PER_CATEGORICAL = 40
